@@ -1,0 +1,225 @@
+diff --git a/arch/powerpc/kernel/rtas.c b/arch/powerpc/kernel/rtas.c
+index 84bf934..4e555a7 100644
+--- a/arch/powerpc/kernel/rtas.c
++++ b/arch/powerpc/kernel/rtas.c
+@@ -213,6 +213,7 @@ void rtas_progress(char *s, unsigned short hex)
+ 	static int current_line;
+ 	static int pending_newline = 0;  /* did last write end with unprinted newline? */
+ 
++        printk("Kernel::=:%s\n", __func__);
+ 	if (!rtas.base)
+ 		return;
+ 
+@@ -323,6 +324,7 @@ EXPORT_SYMBOL(rtas_progress);		/* needed by rtas_flash module */
+ int rtas_token(const char *service)
+ {
+ 	const __be32 *tokp;
++        printk("Kernel::=:%s\n", __func__);
+ 	if (rtas.dev == NULL)
+ 		return RTAS_UNKNOWN_SERVICE;
+ 	tokp = of_get_property(rtas.dev, service, NULL);
+@@ -332,6 +334,7 @@ EXPORT_SYMBOL(rtas_token);
+ 
+ int rtas_service_present(const char *service)
+ {
++        printk("Kernel::=:%s\n", __func__);
+ 	return rtas_token(service) != RTAS_UNKNOWN_SERVICE;
+ }
+ EXPORT_SYMBOL(rtas_service_present);
+@@ -926,13 +929,18 @@ int rtas_ibm_suspend_me(u64 handle)
+ 	cpumask_var_t offline_mask;
+ 	int cpuret;
+ 
+-	if (!rtas_service_present("ibm,suspend-me"))
++        printk("Kernel::=:%s\n", __func__);
++	if (!rtas_service_present("ibm,suspend-me")) {
++		printk("Kernel::=:rtas_service_present(ibm,suspend-me)");
+ 		return -ENOSYS;
++	}
+ 
++	printk("Kernel::=:before:plpar_hcall\n");
+ 	/* Make sure the state is valid */
+ 	rc = plpar_hcall(H_VASI_STATE, retbuf, handle);
+ 
+ 	state = retbuf[0];
++	printk("Kernel::=:before:plpar_hcall:%ld\t state=%ld\n", rc, state);
+ 
+ 	if (rc) {
+ 		printk(KERN_ERR "rtas_ibm_suspend_me: vasi_state returned %ld\n",rc);
+@@ -954,8 +962,10 @@ int rtas_ibm_suspend_me(u64 handle)
+ 	data.token = rtas_token("ibm,suspend-me");
+ 	data.complete = &done;
+ 
++	printk("kernel::cpumask_andnot::\n");
+ 	/* All present CPUs must be online */
+ 	cpumask_andnot(offline_mask, cpu_present_mask, cpu_online_mask);
++	printk("kernel::after cpumask_andnot::\n");
+ 	cpuret = rtas_online_cpus_mask(offline_mask);
+ 	if (cpuret) {
+ 		pr_err("%s: Could not bring present CPUs online.\n", __func__);
+@@ -963,14 +973,17 @@ int rtas_ibm_suspend_me(u64 handle)
+ 		goto out;
+ 	}
+ 
++	printk("kernel::return value of cpuret:rtas_online_cpus_mask = %d\n", cpuret);
+ 	stop_topology_update();
+ 
+ 	/* Call function on all CPUs.  One of us will make the
+ 	 * rtas call
+ 	 */
++	printk("kernel::on_each_cpu:\n");
+ 	if (on_each_cpu(rtas_percpu_suspend_me, &data, 0))
+ 		atomic_set(&data.error, -EINVAL);
+ 
++	printk("kernel::after::on_each_cpu:\n");
+ 	wait_for_completion(&done);
+ 
+ 	if (atomic_read(&data.error) != 0)
+@@ -983,6 +996,8 @@ int rtas_ibm_suspend_me(u64 handle)
+ 	if (cpuret)
+ 		pr_warn("%s: Could not restore CPUs to offline state.\n",
+ 				__func__);
++	
++	printk("kernel::return value of cpuret:rtas_offline_cpus_mask = %d\n", cpuret);
+ 
+ out:
+ 	free_cpumask_var(offline_mask);
+@@ -1129,6 +1144,7 @@ void __init rtas_initialize(void)
+ 	/* Get RTAS dev node and fill up our "rtas" structure with infos
+ 	 * about it.
+ 	 */
++        printk("Kernel::=:%s\n", __func__);
+ 	rtas.dev = of_find_node_by_name(NULL, "rtas");
+ 	if (rtas.dev) {
+ 		const __be32 *basep, *entryp, *sizep;
+diff --git a/arch/powerpc/mm/numa.c b/arch/powerpc/mm/numa.c
+index 8b9502a..881f482 100644
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@ -1555,6 +1555,7 @@ static struct notifier_block dt_update_nb = {
+ int start_topology_update(void)
+ {
+ 	int rc = 0;
++	printk("Kernel::entry%s\n", __func__);
+ 
+ 	if (firmware_has_feature(FW_FEATURE_PRRN)) {
+ 		if (!prrn_enabled) {
+@@ -1574,6 +1575,7 @@ int start_topology_update(void)
+ 			reset_topology_timer();
+ 		}
+ 	}
++	printk("Kernel::exit%s\n", __func__);
+ 
+ 	return rc;
+ }
+@@ -1584,7 +1586,7 @@ int start_topology_update(void)
+ int stop_topology_update(void)
+ {
+ 	int rc = 0;
+-
++	printk("Kernel::entry%s\n", __func__);
+ 	if (prrn_enabled) {
+ 		prrn_enabled = 0;
+ #ifdef CONFIG_SMP
+@@ -1595,6 +1597,7 @@ int stop_topology_update(void)
+ 		rc = del_timer_sync(&topology_timer);
+ 	}
+ 
++	printk("Kernel::exit%s\n", __func__);
+ 	return rc;
+ }
+ 
+diff --git a/arch/powerpc/platforms/pseries/mobility.c b/arch/powerpc/platforms/pseries/mobility.c
+index ceb18d3..494567f 100644
+--- a/arch/powerpc/platforms/pseries/mobility.c
++++ b/arch/powerpc/platforms/pseries/mobility.c
+@@ -243,6 +243,7 @@ int pseries_devicetree_update(s32 scope)
+ 	int update_nodes_token;
+ 	int rc;
+ 
++	printk("Kernel::==%s\n", __func__);
+ 	update_nodes_token = rtas_token("ibm,update-nodes");
+ 	if (update_nodes_token == RTAS_UNKNOWN_SERVICE)
+ 		return -EINVAL;
+@@ -293,6 +294,7 @@ void post_mobility_fixup(void)
+ 	int rc;
+ 	int activate_fw_token;
+ 
++	printk("Kernel::=:%s\n", __func__);
+ 	activate_fw_token = rtas_token("ibm,activate-firmware");
+ 	if (activate_fw_token == RTAS_UNKNOWN_SERVICE) {
+ 		printk(KERN_ERR "Could not make post-mobility "
+@@ -320,7 +322,7 @@ static ssize_t migrate_store(struct class *class, struct class_attribute *attr,
+ {
+ 	u64 streamid;
+ 	int rc;
+-
++	printk("Kernel::=:%s\n", __func__);
+ 	rc = kstrtou64(buf, 0, &streamid);
+ 	if (rc)
+ 		return rc;
+diff --git a/arch/powerpc/platforms/pseries/suspend.c b/arch/powerpc/platforms/pseries/suspend.c
+index e76aefa..749210e 100644
+--- a/arch/powerpc/platforms/pseries/suspend.c
++++ b/arch/powerpc/platforms/pseries/suspend.c
+@@ -46,11 +46,14 @@ static int pseries_suspend_begin(suspend_state_t state)
+ {
+ 	long vasi_state, rc;
+ 	unsigned long retbuf[PLPAR_HCALL_BUFSIZE];
++	
++	printk("Kernel::%s\n", __func__);
+ 
+ 	/* Make sure the state is valid */
+ 	rc = plpar_hcall(H_VASI_STATE, retbuf, stream_id);
+-
+-	vasi_state = retbuf[0];
++	rc = 0;
++//	vasi_state = retbuf[0];
++	vasi_state = H_VASI_SUSPENDING;
+ 
+ 	if (rc) {
+ 		pr_err("pseries_suspend_begin: vasi_state returned %ld\n",rc);
+@@ -91,9 +94,12 @@ static void pseries_suspend_enable_irqs(void)
+ 	 * Update configuration which can be modified based on device tree
+ 	 * changes during resume.
+ 	 */
++	printk("Kernel::=%s:before:\n", __func__);
+ 	cacheinfo_cpu_offline(smp_processor_id());
+ 	post_mobility_fixup();
+ 	cacheinfo_cpu_online(smp_processor_id());
++	printk("Kernel::=%s\n", __func__);
++
+ }
+ 
+ /**
+@@ -147,6 +153,7 @@ static ssize_t store_hibernate(struct device *dev,
+ {
+ 	cpumask_var_t offline_mask;
+ 	int rc;
++	printk("Kernel::entry:%s\n", __func__);
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+@@ -173,9 +180,14 @@ static ssize_t store_hibernate(struct device *dev,
+ 			goto out;
+ 		}
+ 
++		printk("Kernel:: before :stop_topology_update\n");
+ 		stop_topology_update();
++		printk("Kernel:: pm_suspend:before\n");
++	
+ 		rc = pm_suspend(PM_SUSPEND_MEM);
++		printk("Kernel:: pm_suspend:after\n");
+ 		start_topology_update();
++		printk("Kernel:: after :start_topology_update\n");
+ 
+ 		/* Take down CPUs not online prior to suspend */
+ 		if (!rtas_offline_cpus_mask(offline_mask))
+@@ -187,6 +199,7 @@ static ssize_t store_hibernate(struct device *dev,
+ 
+ 	if (!rc)
+ 		rc = count;
++	printk("Kernel::exit:%s\n", __func__);
+ out:
+ 	free_cpumask_var(offline_mask);
+ 	return rc;
