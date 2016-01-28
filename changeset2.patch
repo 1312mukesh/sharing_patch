@@ -1,0 +1,286 @@
+diff --git a/hw/Makefile.inc b/hw/Makefile.inc
+index c674bbd..6194fe1 100644
+--- a/hw/Makefile.inc
++++ b/hw/Makefile.inc
+@@ -1,7 +1,7 @@
+ # -*-Makefile-*-
+ 
+ SUBDIRS += hw
+-HW_OBJS  = xscom.o chiptod.o gx.o cec.o lpc.o lpc-uart.o psi.o common-elog.o
++HW_OBJS  = xscom.o chiptod.o gx.o cec.o lpc.o lpc-uart.o psi.o elog-common.o
+ HW_OBJS += homer.o slw.o occ.o fsi-master.o centaur.o
+ HW_OBJS += nx.o nx-rng.o nx-crypto.o nx-842.o
+ HW_OBJS += p7ioc.o p7ioc-inits.o p7ioc-phb.o
+diff --git a/hw/elog-common.c b/hw/elog-common.c
+index 85b33d0..878a334 100644
+--- a/hw/elog-common.c
++++ b/hw/elog-common.c
+@@ -1,4 +1,4 @@
+-/* Copyright 2013-2014 IBM Corp.
++/* Copyright 2013-2016 IBM Corp.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -27,7 +27,7 @@
+ #include <cpu.h>
+ #include <lock.h>
+ #include <errno.h>
+-#include <common-elog.h>
++#include <elog-common.h>
+ #include <timebase.h>
+ #include <pel.h>
+ #include <pool.h>
+@@ -198,10 +198,10 @@ void elog_append_write_to_host(struct errorlog *buf)
+ /* Pre-allocate memory for reading error log from FSP or BMC */
+ int init_elog_read_free_list(uint32_t num_entries)
+ {
+-        struct log_entry *entry;
++        struct event_log_entry *entry;
+         int i;
+ 
+-        entry = zalloc(sizeof(struct log_entry) * num_entries);
++        entry = zalloc(sizeof(struct event_log_entry) * num_entries);
+         if (!entry)
+                 goto out_err;
+ 
+diff --git a/hw/fsp/fsp-attn.c b/hw/fsp/fsp-attn.c
+index decc4e4..8c063eb 100644
+--- a/hw/fsp/fsp-attn.c
++++ b/hw/fsp/fsp-attn.c
+@@ -15,7 +15,7 @@
+ */
+ #include <fsp.h>
+ #include <skiboot.h>
+-#include <common-elog.h>
++#include <elog-common.h>
+ #include <fsp-attn.h>
+ #include <hdata/spira.h>
+ #include <stack.h>
+diff --git a/hw/fsp/fsp-codeupdate.c b/hw/fsp/fsp-codeupdate.c
+index 6841446..1fe0820 100644
+--- a/hw/fsp/fsp-codeupdate.c
++++ b/hw/fsp/fsp-codeupdate.c
+@@ -23,7 +23,7 @@
+ #include <ccan/endian/endian.h>
+ #include <errorlog.h>
+ #include <opal-api.h>
+-#include <common-elog.h>
++#include <elog-common.h>
+ #include <timebase.h>
+ 
+ #include "fsp-codeupdate.h"
+diff --git a/hw/fsp/fsp-elog-read.c b/hw/fsp/fsp-elog-read.c
+index bf2570d..9f7ab7e 100644
+--- a/hw/fsp/fsp-elog-read.c
++++ b/hw/fsp/fsp-elog-read.c
+@@ -1,4 +1,4 @@
+-/* Copyright 2013-2014 IBM Corp.
++/* Copyright 2013-2016 IBM Corp.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -52,7 +52,7 @@
+ #include <lock.h>
+ #include <errno.h>
+ #include <psi.h>
+-#include <common-elog.h>
++#include <elog-common.h>
+ #include <opal-api.h>
+ 
+ static LIST_HEAD(elog_read_pending);
+@@ -156,10 +156,10 @@ static void fsp_elog_set_head_state(enum elog_head_state state)
+  */
+ static void fsp_elog_fetch_failure(uint8_t fsp_status)
+ {
+-	struct log_entry *log_data;
++	struct event_log_entry *log_data;
+ 
+ 	/* read top list and delete the node */
+-	log_data = list_top(&elog_read_pending, struct log_entry, link);
++	log_data = list_top(&elog_read_pending, struct event_log_entry, link);
+ 	if (!log_data) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -177,7 +177,7 @@ static void fsp_elog_fetch_failure(uint8_t fsp_status)
+ static void fsp_elog_read_complete(struct fsp_msg *read_msg)
+ {
+ 	uint8_t val;
+-	/*struct log_entry *log_data;*/
++	/*struct event_log_entry *log_data;*/
+ 
+ 	lock(&elog_read_lock);
+ 	val = (read_msg->resp->word1 >> 8) & 0xff;
+@@ -223,9 +223,9 @@ static void fsp_elog_queue_fetch(void)
+ {
+ 	int rc;
+ 	uint8_t flags = 0;
+-	struct log_entry *entry;
++	struct event_log_entry *entry;
+ 
+-	entry = list_top(&elog_read_pending, struct log_entry, link);
++	entry = list_top(&elog_read_pending, struct event_log_entry, link);
+ 	if (!entry) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -249,7 +249,7 @@ static void fsp_elog_queue_fetch(void)
+ static int64_t fsp_opal_elog_info(uint64_t *opal_elog_id,
+ 				  uint64_t *opal_elog_size, uint64_t *elog_type)
+ {
+-	struct log_entry *log_data;
++	struct event_log_entry *log_data;
+ 
+ 	/* copy type of the error log */
+ 	*elog_type = ELOG_TYPE_PEL;
+@@ -263,7 +263,7 @@ static int64_t fsp_opal_elog_info(uint64_t *opal_elog_id,
+ 		unlock(&elog_read_lock);
+ 		return OPAL_WRONG_STATE;
+ 	}
+-	log_data = list_top(&elog_read_pending, struct log_entry, link);
++	log_data = list_top(&elog_read_pending, struct event_log_entry, link);
+ 	if (!log_data) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -281,7 +281,7 @@ static int64_t fsp_opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
+ 				  uint64_t opal_elog_id)
+ {
+ 	int size = opal_elog_size;
+-	struct log_entry *log_data;
++	struct event_log_entry *log_data;
+ 
+ 
+ 	/* Check if any OPAL log needs to be reported to the host */
+@@ -297,7 +297,7 @@ static int64_t fsp_opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
+ 		return OPAL_WRONG_STATE;
+ 	}
+ 
+-	log_data = list_top(&elog_read_pending, struct log_entry, link);
++	log_data = list_top(&elog_read_pending, struct event_log_entry, link);
+ 	if (!log_data) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -348,7 +348,7 @@ static void elog_reject_head(void)
+ static int64_t fsp_opal_elog_ack(uint64_t ack_id)
+ {
+ 	int rc = 0;
+-	struct log_entry  *record, *next_record;
++	struct event_log_entry  *record, *next_record;
+ 
+ 	if (opal_elog_ack(ack_id))
+ 		return rc;
+@@ -383,7 +383,7 @@ static int64_t fsp_opal_elog_ack(uint64_t ack_id)
+  */
+ static void fsp_opal_resend_pending_logs(void)
+ {
+-	struct log_entry  *entry;
++	struct event_log_entry  *entry;
+ 
+ 	/* Check if any Sapphire logs are pending */
+ 	opal_resend_pending_logs();
+@@ -396,7 +396,7 @@ static void fsp_opal_resend_pending_logs(void)
+ 	 */
+ 	while (!list_empty(&elog_read_processed)) {
+ 		entry = list_pop(&elog_read_processed,
+-					 struct log_entry, link);
++					 struct event_log_entry, link);
+ 		list_add(&elog_read_pending, &entry->link);
+ 	}
+ 
+@@ -406,7 +406,7 @@ static void fsp_opal_resend_pending_logs(void)
+ 	 */
+ 	if (!list_empty(&elog_read_pending)) {
+ 		entry = list_top(&elog_read_pending,
+-					 struct log_entry, link);
++					 struct event_log_entry, link);
+ 		if (entry->log_id != elog_head_id)
+ 			elog_reject_head();
+ 	}
+@@ -421,7 +421,7 @@ static void fsp_opal_resend_pending_logs(void)
+ static bool fsp_elog_msg(uint32_t cmd_sub_mod, struct fsp_msg *msg)
+ {
+ 	int rc = 0;
+-	struct log_entry  *record;
++	struct event_log_entry  *record;
+ 	uint32_t log_id;
+ 	uint32_t log_size;
+ 
+@@ -446,7 +446,7 @@ static bool fsp_elog_msg(uint32_t cmd_sub_mod, struct fsp_msg *msg)
+ 	lock(&elog_read_lock);
+ 	if (!list_empty(&elog_read_free)) {
+ 		/* Create a new entry in the pending list */
+-		record = list_pop(&elog_read_free, struct log_entry, link);
++		record = list_pop(&elog_read_free, struct event_log_entry, link);
+ 		record->log_id = log_id;
+ 		record->log_size = log_size;
+ 		list_add_tail(&elog_read_pending, &record->link);
+diff --git a/hw/fsp/fsp-elog-write.c b/hw/fsp/fsp-elog-write.c
+index 214c5b3..1a2b032 100644
+--- a/hw/fsp/fsp-elog-write.c
++++ b/hw/fsp/fsp-elog-write.c
+@@ -1,4 +1,4 @@
+-/* Copyright 2013-2014 IBM Corp.
++/* Copyright 2013-2016 IBM Corp.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -29,7 +29,7 @@
+ #include <cpu.h>
+ #include <lock.h>
+ #include <errno.h>
+-#include <common-elog.h>
++#include <elog-common.h>
+ #include <timebase.h>
+ #include <pel.h>
+ #include <pool.h>
+@@ -40,7 +40,7 @@ static LIST_HEAD(elog_write_to_fsp_pending);
+ static struct lock elog_write_lock = LOCK_UNLOCKED;
+ static struct lock elog_panic_write_lock = LOCK_UNLOCKED;
+ 
+-/* log buffer to WRITE into fsp */
++/* log buffer to WRITE into FSP */
+ #define ELOG_WRITE_TO_FSP_BUFFER_SIZE	0x00004000
+ static void *elog_write_to_fsp_buffer;
+ 
+diff --git a/hw/p8-i2c.c b/hw/p8-i2c.c
+index 414d761..9653c2e 100644
+--- a/hw/p8-i2c.c
++++ b/hw/p8-i2c.c
+@@ -29,7 +29,7 @@
+ #include <errorlog.h>
+ #include <centaur.h>
+ /* XXX SRC's will be moved to errorlog.h and then remove fsp-elog.h */
+-#include <common-elog.h>
++#include <elog-common.h>
+ 
+ DEFINE_LOG_ENTRY(OPAL_RC_I2C_INIT, OPAL_PLATFORM_ERR_EVT, OPAL_I2C,
+ 		 OPAL_IO_SUBSYSTEM, OPAL_PREDICTIVE_ERR_DEGRADED_PERF,
+diff --git a/include/elog-common.h b/include/elog-common.h
+index 732b81c..5048d13 100644
+--- a/include/elog-common.h
++++ b/include/elog-common.h
+@@ -1,4 +1,4 @@
+-/* Copyright 2013-2014 IBM Corp.
++/* Copyright 2013-2016 IBM Corp.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -16,11 +16,11 @@
+ #include <opal.h>
+ #include <errorlog.h>
+ #include <pel.h>
+-#ifndef __OPALELOG_H
+-#define __OPALELOG_H
++#ifndef __ELOG_COMMON_H
++#define __ELOG_COMMON_H
+ 
+ /* structure to maintain log-id,log-size, pending and processed list */
+-struct log_entry {
++struct event_log_entry {
+         uint32_t log_id;
+         size_t log_size;
+         struct list_node link;
+@@ -77,4 +77,4 @@ void elog_append_write_to_host(struct errorlog *buf);
+ 
+ int init_elog_read_free_list(uint32_t);
+ 
+-#endif /* __OPALELOG_H */
++#endif /* __ELOG_COMMON_H */
