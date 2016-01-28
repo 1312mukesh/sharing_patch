@@ -1,0 +1,844 @@
+From 6ccd17bc262136a47c76f019891aaa70870f3dda Mon Sep 17 00:00:00 2001
+From: mukesh kumar ojha <mukesh02@linux.vnet.ibm.com>
+Date: Wed, 27 Jan 2016 12:00:34 -0600
+Subject: [PATCH] Moved the generic errorlog read/write routines to a file
+ hw/common-elog.c, so that it could be used for BMC system as well
+
+---
+ hw/Makefile.inc         |   2 +-
+ hw/common-elog.c        | 217 ++++++++++++++++++++++++++++++++++++++++++++++++
+ hw/fsp/fsp-attn.c       |   2 +-
+ hw/fsp/fsp-codeupdate.c |   2 +-
+ hw/fsp/fsp-elog-read.c  |  70 ++++------------
+ hw/fsp/fsp-elog-write.c | 161 +----------------------------------
+ hw/p8-i2c.c             |   2 +-
+ include/common-elog.h   |  80 ++++++++++++++++++
+ include/fsp-elog.h      |  53 ------------
+ 9 files changed, 321 insertions(+), 268 deletions(-)
+ create mode 100644 hw/common-elog.c
+ create mode 100644 include/common-elog.h
+ delete mode 100644 include/fsp-elog.h
+
+diff --git a/hw/Makefile.inc b/hw/Makefile.inc
+index a9dd9f1..c674bbd 100644
+--- a/hw/Makefile.inc
++++ b/hw/Makefile.inc
+@@ -1,7 +1,7 @@
+ # -*-Makefile-*-
+ 
+ SUBDIRS += hw
+-HW_OBJS  = xscom.o chiptod.o gx.o cec.o lpc.o lpc-uart.o psi.o
++HW_OBJS  = xscom.o chiptod.o gx.o cec.o lpc.o lpc-uart.o psi.o common-elog.o
+ HW_OBJS += homer.o slw.o occ.o fsi-master.o centaur.o
+ HW_OBJS += nx.o nx-rng.o nx-crypto.o nx-842.o
+ HW_OBJS += p7ioc.o p7ioc-inits.o p7ioc-phb.o
+diff --git a/hw/common-elog.c b/hw/common-elog.c
+new file mode 100644
+index 0000000..85b33d0
+--- /dev/null
++++ b/hw/common-elog.c
+@@ -0,0 +1,217 @@
++/* Copyright 2013-2014 IBM Corp.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * 	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++ * implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++/*
++ * This code provides common routines, which can be used for
++ * error log read/write in both FSP and BMC based systems.
++ * Previously, These functions were used in FSP. Our motto was
++ * to develop a common platform for both type of systems.
++ */
++
++#include <skiboot.h>
++#include <fsp.h>
++#include <cpu.h>
++#include <lock.h>
++#include <errno.h>
++#include <common-elog.h>
++#include <timebase.h>
++#include <pel.h>
++#include <pool.h>
++#include <opal-api.h>
++
++LIST_HEAD(elog_read_free);
++static LIST_HEAD(elog_write_to_host_pending);
++static LIST_HEAD(elog_write_to_host_processed);
++
++static struct lock elog_write_to_host_lock = LOCK_UNLOCKED;
++
++static void *elog_write_to_host_buffer;
++
++/* Manipulate this only with write_lock held */
++static enum elog_head_state elog_write_to_host_head_state = ELOG_STATE_NONE;
++
++bool opal_elog_info(uint64_t *opal_elog_id, uint64_t *opal_elog_size)
++{
++	struct errorlog *head;
++	bool rc = false;
++
++	lock(&elog_write_to_host_lock);
++	if (elog_write_to_host_head_state == ELOG_STATE_FETCHED_DATA) {
++		head = list_top(&elog_write_to_host_pending,
++					struct errorlog, link);
++		if (!head) {
++			prlog(PR_ERR,
++			      "%s: Inconsistent internal list state !\n",
++			      __func__);
++			elog_write_to_host_head_state = ELOG_STATE_NONE;
++		} else {
++			*opal_elog_id = head->plid;
++			*opal_elog_size = head->log_size;
++			elog_write_to_host_head_state = ELOG_STATE_FETCHED_INFO;
++			rc = true;
++		}
++	}
++	unlock(&elog_write_to_host_lock);
++	return rc;
++}
++
++void opal_commit_elog_in_host(void)
++{
++
++	struct errorlog *buf;
++
++	lock(&elog_write_to_host_lock);
++	if (!list_empty(&elog_write_to_host_pending) &&
++			(elog_write_to_host_head_state == ELOG_STATE_NONE)) {
++		buf = list_top(&elog_write_to_host_pending,
++				struct errorlog, link);
++		buf->log_size = create_pel_log(buf,
++					       (char *)elog_write_to_host_buffer,
++					       ELOG_WRITE_TO_HOST_BUFFER_SIZE);
++		elog_write_to_host_head_state = ELOG_STATE_FETCHED_DATA;
++		opal_update_pending_evt(OPAL_EVENT_ERROR_LOG_AVAIL,
++					OPAL_EVENT_ERROR_LOG_AVAIL);
++	}
++	unlock(&elog_write_to_host_lock);
++}
++
++
++bool opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
++		    uint64_t opal_elog_id)
++{
++	struct errorlog *log_data;
++	bool rc = false;
++
++	lock(&elog_write_to_host_lock);
++	if (elog_write_to_host_head_state == ELOG_STATE_FETCHED_INFO) {
++		log_data = list_top(&elog_write_to_host_pending,
++					struct errorlog, link);
++		if (!log_data) {
++			elog_write_to_host_head_state = ELOG_STATE_NONE;
++			unlock(&elog_write_to_host_lock);
++			return rc;
++		}
++		if ((opal_elog_id != log_data->plid) &&
++		    (opal_elog_size != log_data->log_size)) {
++			unlock(&elog_write_to_host_lock);
++			return rc;
++		}
++
++		memcpy((void *)buffer, elog_write_to_host_buffer,
++							opal_elog_size);
++
++		list_del(&log_data->link);
++		list_add(&elog_write_to_host_processed, &log_data->link);
++		elog_write_to_host_head_state = ELOG_STATE_NONE;
++		rc = true;
++	}
++	unlock(&elog_write_to_host_lock);
++	opal_commit_elog_in_host();
++	return rc;
++}
++
++bool opal_elog_ack(uint64_t ack_id)
++{
++	bool rc = false;
++	struct errorlog *log_data;
++	struct errorlog *record, *next_record;
++
++	lock(&elog_write_to_host_lock);
++	if (!list_empty(&elog_write_to_host_processed)) {
++		list_for_each_safe(&elog_write_to_host_processed, record,
++							next_record, link) {
++			if (record->plid != ack_id)
++				continue;
++			list_del(&record->link);
++			opal_elog_complete(record, true);
++			rc = true;
++		}
++	}
++
++	if ((!rc) && (!list_empty(&elog_write_to_host_pending))) {
++		log_data = list_top(&elog_write_to_host_pending,
++					struct errorlog, link);
++		if (ack_id == log_data->plid)
++			elog_write_to_host_head_state = ELOG_STATE_NONE;
++
++		list_for_each_safe(&elog_write_to_host_pending, record,
++							next_record, link) {
++			if (record->plid != ack_id)
++				continue;
++			list_del(&record->link);
++			opal_elog_complete(record, true);
++			rc = true;
++		}
++	}
++	unlock(&elog_write_to_host_lock);
++	return rc;
++}
++
++void opal_resend_pending_logs(void)
++{
++	struct errorlog *record;
++
++	lock(&elog_write_to_host_lock);
++	if (list_empty(&elog_write_to_host_processed)) {
++		unlock(&elog_write_to_host_lock);
++		return;
++	}
++
++	while (!list_empty(&elog_write_to_host_processed)) {
++		record = list_pop(&elog_write_to_host_processed,
++					struct errorlog, link);
++		list_add_tail(&elog_write_to_host_pending, &record->link);
++	}
++	elog_write_to_host_head_state = ELOG_STATE_NONE;
++	unlock(&elog_write_to_host_lock);
++	opal_commit_elog_in_host();
++}
++
++void elog_append_write_to_host(struct errorlog *buf)
++{
++
++	lock(&elog_write_to_host_lock);
++	if (list_empty(&elog_write_to_host_pending)) {
++		list_add(&elog_write_to_host_pending, &buf->link);
++		unlock(&elog_write_to_host_lock);
++		opal_commit_elog_in_host();
++	} else {
++		list_add_tail(&elog_write_to_host_pending, &buf->link);
++		unlock(&elog_write_to_host_lock);
++	}
++}
++
++/* Pre-allocate memory for reading error log from FSP or BMC */
++int init_elog_read_free_list(uint32_t num_entries)
++{
++        struct log_entry *entry;
++        int i;
++
++        entry = zalloc(sizeof(struct log_entry) * num_entries);
++        if (!entry)
++                goto out_err;
++
++        for (i = 0; i < num_entries; ++i) {
++                list_add_tail(&elog_read_free, &entry->link);
++                entry++;
++        }
++        return 0;
++
++out_err:
++        return -ENOMEM;
++}
++
+diff --git a/hw/fsp/fsp-attn.c b/hw/fsp/fsp-attn.c
+index 7b56192..decc4e4 100644
+--- a/hw/fsp/fsp-attn.c
++++ b/hw/fsp/fsp-attn.c
+@@ -15,7 +15,7 @@
+ */
+ #include <fsp.h>
+ #include <skiboot.h>
+-#include <fsp-elog.h>
++#include <common-elog.h>
+ #include <fsp-attn.h>
+ #include <hdata/spira.h>
+ #include <stack.h>
+diff --git a/hw/fsp/fsp-codeupdate.c b/hw/fsp/fsp-codeupdate.c
+index f6293a0..6841446 100644
+--- a/hw/fsp/fsp-codeupdate.c
++++ b/hw/fsp/fsp-codeupdate.c
+@@ -23,7 +23,7 @@
+ #include <ccan/endian/endian.h>
+ #include <errorlog.h>
+ #include <opal-api.h>
+-#include <fsp-elog.h>
++#include <common-elog.h>
+ #include <timebase.h>
+ 
+ #include "fsp-codeupdate.h"
+diff --git a/hw/fsp/fsp-elog-read.c b/hw/fsp/fsp-elog-read.c
+index 16667ae..bf2570d 100644
+--- a/hw/fsp/fsp-elog-read.c
++++ b/hw/fsp/fsp-elog-read.c
+@@ -52,25 +52,13 @@
+ #include <lock.h>
+ #include <errno.h>
+ #include <psi.h>
+-#include <fsp-elog.h>
++#include <common-elog.h>
+ #include <opal-api.h>
+ 
+-/*
+- * Maximum number of entries that are pre-allocated
+- * to keep track of pending elogs to be fetched.
+- */
+-#define ELOG_READ_MAX_RECORD		128
+-
+-/* structure to maintain log-id,log-size, pending and processed list */
+-struct fsp_log_entry {
+-	uint32_t log_id;
+-	size_t log_size;
+-	struct list_node link;
+-};
+-
+ static LIST_HEAD(elog_read_pending);
+ static LIST_HEAD(elog_read_processed);
+-static LIST_HEAD(elog_read_free);
++
++extern struct list_head elog_read_free;
+ 
+ /*
+  * lock is used to protect overwriting of processed and pending list
+@@ -78,8 +66,6 @@ static LIST_HEAD(elog_read_free);
+  */
+ static struct lock elog_read_lock = LOCK_UNLOCKED;
+ 
+-/* log buffer  to copy FSP log for READ */
+-#define ELOG_READ_BUFFER_SIZE	0x00004000
+ static void *elog_read_buffer;
+ static uint32_t elog_head_id;	/* FSP entry ID */
+ static size_t elog_head_size;	/* actual FSP log size */
+@@ -170,10 +156,10 @@ static void fsp_elog_set_head_state(enum elog_head_state state)
+  */
+ static void fsp_elog_fetch_failure(uint8_t fsp_status)
+ {
+-	struct fsp_log_entry *log_data;
++	struct log_entry *log_data;
+ 
+ 	/* read top list and delete the node */
+-	log_data = list_top(&elog_read_pending, struct fsp_log_entry, link);
++	log_data = list_top(&elog_read_pending, struct log_entry, link);
+ 	if (!log_data) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -191,7 +177,7 @@ static void fsp_elog_fetch_failure(uint8_t fsp_status)
+ static void fsp_elog_read_complete(struct fsp_msg *read_msg)
+ {
+ 	uint8_t val;
+-	/*struct fsp_log_entry *log_data;*/
++	/*struct log_entry *log_data;*/
+ 
+ 	lock(&elog_read_lock);
+ 	val = (read_msg->resp->word1 >> 8) & 0xff;
+@@ -237,9 +223,9 @@ static void fsp_elog_queue_fetch(void)
+ {
+ 	int rc;
+ 	uint8_t flags = 0;
+-	struct fsp_log_entry *entry;
++	struct log_entry *entry;
+ 
+-	entry = list_top(&elog_read_pending, struct fsp_log_entry, link);
++	entry = list_top(&elog_read_pending, struct log_entry, link);
+ 	if (!entry) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -263,7 +249,7 @@ static void fsp_elog_queue_fetch(void)
+ static int64_t fsp_opal_elog_info(uint64_t *opal_elog_id,
+ 				  uint64_t *opal_elog_size, uint64_t *elog_type)
+ {
+-	struct fsp_log_entry *log_data;
++	struct log_entry *log_data;
+ 
+ 	/* copy type of the error log */
+ 	*elog_type = ELOG_TYPE_PEL;
+@@ -277,7 +263,7 @@ static int64_t fsp_opal_elog_info(uint64_t *opal_elog_id,
+ 		unlock(&elog_read_lock);
+ 		return OPAL_WRONG_STATE;
+ 	}
+-	log_data = list_top(&elog_read_pending, struct fsp_log_entry, link);
++	log_data = list_top(&elog_read_pending, struct log_entry, link);
+ 	if (!log_data) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -295,7 +281,7 @@ static int64_t fsp_opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
+ 				  uint64_t opal_elog_id)
+ {
+ 	int size = opal_elog_size;
+-	struct fsp_log_entry *log_data;
++	struct log_entry *log_data;
+ 
+ 
+ 	/* Check if any OPAL log needs to be reported to the host */
+@@ -311,7 +297,7 @@ static int64_t fsp_opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
+ 		return OPAL_WRONG_STATE;
+ 	}
+ 
+-	log_data = list_top(&elog_read_pending, struct fsp_log_entry, link);
++	log_data = list_top(&elog_read_pending, struct log_entry, link);
+ 	if (!log_data) {
+ 		prlog(PR_ERR, "%s: Inconsistent internal list state !\n",
+ 		      __func__);
+@@ -362,7 +348,7 @@ static void elog_reject_head(void)
+ static int64_t fsp_opal_elog_ack(uint64_t ack_id)
+ {
+ 	int rc = 0;
+-	struct fsp_log_entry  *record, *next_record;
++	struct log_entry  *record, *next_record;
+ 
+ 	if (opal_elog_ack(ack_id))
+ 		return rc;
+@@ -397,7 +383,7 @@ static int64_t fsp_opal_elog_ack(uint64_t ack_id)
+  */
+ static void fsp_opal_resend_pending_logs(void)
+ {
+-	struct fsp_log_entry  *entry;
++	struct log_entry  *entry;
+ 
+ 	/* Check if any Sapphire logs are pending */
+ 	opal_resend_pending_logs();
+@@ -410,7 +396,7 @@ static void fsp_opal_resend_pending_logs(void)
+ 	 */
+ 	while (!list_empty(&elog_read_processed)) {
+ 		entry = list_pop(&elog_read_processed,
+-					 struct fsp_log_entry, link);
++					 struct log_entry, link);
+ 		list_add(&elog_read_pending, &entry->link);
+ 	}
+ 
+@@ -420,7 +406,7 @@ static void fsp_opal_resend_pending_logs(void)
+ 	 */
+ 	if (!list_empty(&elog_read_pending)) {
+ 		entry = list_top(&elog_read_pending,
+-					 struct fsp_log_entry, link);
++					 struct log_entry, link);
+ 		if (entry->log_id != elog_head_id)
+ 			elog_reject_head();
+ 	}
+@@ -435,7 +421,7 @@ static void fsp_opal_resend_pending_logs(void)
+ static bool fsp_elog_msg(uint32_t cmd_sub_mod, struct fsp_msg *msg)
+ {
+ 	int rc = 0;
+-	struct fsp_log_entry  *record;
++	struct log_entry  *record;
+ 	uint32_t log_id;
+ 	uint32_t log_size;
+ 
+@@ -460,7 +446,7 @@ static bool fsp_elog_msg(uint32_t cmd_sub_mod, struct fsp_msg *msg)
+ 	lock(&elog_read_lock);
+ 	if (!list_empty(&elog_read_free)) {
+ 		/* Create a new entry in the pending list */
+-		record = list_pop(&elog_read_free, struct fsp_log_entry, link);
++		record = list_pop(&elog_read_free, struct log_entry, link);
+ 		record->log_id = log_id;
+ 		record->log_size = log_size;
+ 		list_add_tail(&elog_read_pending, &record->link);
+@@ -509,26 +495,6 @@ static struct fsp_client fsp_get_elog_notify = {
+ 	.message = fsp_elog_msg,
+ };
+ 
+-/* Pre-allocate memory for reading error log from FSP */
+-static int init_elog_read_free_list(uint32_t num_entries)
+-{
+-	struct fsp_log_entry *entry;
+-	int i;
+-
+-	entry = zalloc(sizeof(struct fsp_log_entry) * num_entries);
+-	if (!entry)
+-		goto out_err;
+-
+-	for (i = 0; i < num_entries; ++i) {
+-		list_add_tail(&elog_read_free, &entry->link);
+-		entry++;
+-	}
+-	return 0;
+-
+-out_err:
+-	return -ENOMEM;
+-}
+-
+ /* fsp elog read init function */
+ void fsp_elog_read_init(void)
+ {
+diff --git a/hw/fsp/fsp-elog-write.c b/hw/fsp/fsp-elog-write.c
+index cf915a2..214c5b3 100644
+--- a/hw/fsp/fsp-elog-write.c
++++ b/hw/fsp/fsp-elog-write.c
+@@ -29,35 +29,29 @@
+ #include <cpu.h>
+ #include <lock.h>
+ #include <errno.h>
+-#include <fsp-elog.h>
++#include <common-elog.h>
+ #include <timebase.h>
+ #include <pel.h>
+ #include <pool.h>
+ #include <opal-api.h>
+ 
+ static LIST_HEAD(elog_write_to_fsp_pending);
+-static LIST_HEAD(elog_write_to_host_pending);
+-static LIST_HEAD(elog_write_to_host_processed);
+ 
+ static struct lock elog_write_lock = LOCK_UNLOCKED;
+ static struct lock elog_panic_write_lock = LOCK_UNLOCKED;
+-static struct lock elog_write_to_host_lock = LOCK_UNLOCKED;
+ 
+-/* log buffer  to copy FSP log for READ */
++/* log buffer to WRITE into fsp */
+ #define ELOG_WRITE_TO_FSP_BUFFER_SIZE	0x00004000
+ static void *elog_write_to_fsp_buffer;
+ 
+-#define ELOG_PANIC_WRITE_BUFFER_SIZE	0x00004000
+ static void *elog_panic_write_buffer;
+ 
+-#define ELOG_WRITE_TO_HOST_BUFFER_SIZE	0x00004000
+ static void *elog_write_to_host_buffer;
+ 
+ static uint32_t elog_write_retries;
+ 
+ /* Manipulate this only with write_lock held */
+ static uint32_t elog_plid_fsp_commit = -1;
+-static enum elog_head_state elog_write_to_host_head_state = ELOG_STATE_NONE;
+ 
+ /* Need forward declaration because of Circular dependency */
+ static int opal_send_elog_to_fsp(void);
+@@ -126,143 +120,6 @@ static int64_t fsp_opal_elog_write(size_t opal_elog_size)
+ 	return OPAL_SUCCESS;
+ }
+ 
+-bool opal_elog_info(uint64_t *opal_elog_id, uint64_t *opal_elog_size)
+-{
+-	struct errorlog *head;
+-	bool rc = false;
+-
+-	lock(&elog_write_to_host_lock);
+-	if (elog_write_to_host_head_state == ELOG_STATE_FETCHED_DATA) {
+-		head = list_top(&elog_write_to_host_pending,
+-					struct errorlog, link);
+-		if (!head) {
+-			prlog(PR_ERR,
+-			      "%s: Inconsistent internal list state !\n",
+-			      __func__);
+-			elog_write_to_host_head_state = ELOG_STATE_NONE;
+-		} else {
+-			*opal_elog_id = head->plid;
+-			*opal_elog_size = head->log_size;
+-			elog_write_to_host_head_state = ELOG_STATE_FETCHED_INFO;
+-			rc = true;
+-		}
+-	}
+-	unlock(&elog_write_to_host_lock);
+-	return rc;
+-}
+-
+-static void opal_commit_elog_in_host(void)
+-{
+-
+-	struct errorlog *buf;
+-
+-	lock(&elog_write_to_host_lock);
+-	if (!list_empty(&elog_write_to_host_pending) &&
+-			(elog_write_to_host_head_state == ELOG_STATE_NONE)) {
+-		buf = list_top(&elog_write_to_host_pending,
+-				struct errorlog, link);
+-		buf->log_size = create_pel_log(buf,
+-					       (char *)elog_write_to_host_buffer,
+-					       ELOG_WRITE_TO_HOST_BUFFER_SIZE);
+-		elog_write_to_host_head_state = ELOG_STATE_FETCHED_DATA;
+-		opal_update_pending_evt(OPAL_EVENT_ERROR_LOG_AVAIL,
+-					OPAL_EVENT_ERROR_LOG_AVAIL);
+-	}
+-	unlock(&elog_write_to_host_lock);
+-}
+-
+-
+-bool opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
+-		    uint64_t opal_elog_id)
+-{
+-	struct errorlog *log_data;
+-	bool rc = false;
+-
+-	lock(&elog_write_to_host_lock);
+-	if (elog_write_to_host_head_state == ELOG_STATE_FETCHED_INFO) {
+-		log_data = list_top(&elog_write_to_host_pending,
+-					struct errorlog, link);
+-		if (!log_data) {
+-			elog_write_to_host_head_state = ELOG_STATE_NONE;
+-			unlock(&elog_write_to_host_lock);
+-			return rc;
+-		}
+-		if ((opal_elog_id != log_data->plid) &&
+-		    (opal_elog_size != log_data->log_size)) {
+-			unlock(&elog_write_to_host_lock);
+-			return rc;
+-		}
+-
+-		memcpy((void *)buffer, elog_write_to_host_buffer,
+-							opal_elog_size);
+-
+-		list_del(&log_data->link);
+-		list_add(&elog_write_to_host_processed, &log_data->link);
+-		elog_write_to_host_head_state = ELOG_STATE_NONE;
+-		rc = true;
+-	}
+-	unlock(&elog_write_to_host_lock);
+-	opal_commit_elog_in_host();
+-	return rc;
+-}
+-
+-bool opal_elog_ack(uint64_t ack_id)
+-{
+-	bool rc = false;
+-	struct errorlog *log_data;
+-	struct errorlog *record, *next_record;
+-
+-	lock(&elog_write_to_host_lock);
+-	if (!list_empty(&elog_write_to_host_processed)) {
+-		list_for_each_safe(&elog_write_to_host_processed, record,
+-							next_record, link) {
+-			if (record->plid != ack_id)
+-				continue;
+-			list_del(&record->link);
+-			opal_elog_complete(record, true);
+-			rc = true;
+-		}
+-	}
+-
+-	if ((!rc) && (!list_empty(&elog_write_to_host_pending))) {
+-		log_data = list_top(&elog_write_to_host_pending,
+-					struct errorlog, link);
+-		if (ack_id == log_data->plid)
+-			elog_write_to_host_head_state = ELOG_STATE_NONE;
+-
+-		list_for_each_safe(&elog_write_to_host_pending, record,
+-							next_record, link) {
+-			if (record->plid != ack_id)
+-				continue;
+-			list_del(&record->link);
+-			opal_elog_complete(record, true);
+-			rc = true;
+-		}
+-	}
+-	unlock(&elog_write_to_host_lock);
+-	return rc;
+-}
+-
+-void opal_resend_pending_logs(void)
+-{
+-	struct errorlog *record;
+-
+-	lock(&elog_write_to_host_lock);
+-	if (list_empty(&elog_write_to_host_processed)) {
+-		unlock(&elog_write_to_host_lock);
+-		return;
+-	}
+-
+-	while (!list_empty(&elog_write_to_host_processed)) {
+-		record = list_pop(&elog_write_to_host_processed,
+-					struct errorlog, link);
+-		list_add_tail(&elog_write_to_host_pending, &record->link);
+-	}
+-	elog_write_to_host_head_state = ELOG_STATE_NONE;
+-	unlock(&elog_write_to_host_lock);
+-	opal_commit_elog_in_host();
+-}
+-
+ static int opal_send_elog_to_fsp(void)
+ {
+ 	struct errorlog *head;
+@@ -354,20 +211,6 @@ int elog_fsp_commit(struct errorlog *buf)
+ 	return rc;
+ }
+ 
+-static void elog_append_write_to_host(struct errorlog *buf)
+-{
+-
+-	lock(&elog_write_to_host_lock);
+-	if (list_empty(&elog_write_to_host_pending)) {
+-		list_add(&elog_write_to_host_pending, &buf->link);
+-		unlock(&elog_write_to_host_lock);
+-		opal_commit_elog_in_host();
+-	} else {
+-		list_add_tail(&elog_write_to_host_pending, &buf->link);
+-		unlock(&elog_write_to_host_lock);
+-	}
+-}
+-
+ static void elog_timeout_poll(void *data __unused)
+ {
+ 	uint64_t now;
+diff --git a/hw/p8-i2c.c b/hw/p8-i2c.c
+index 66510f1..414d761 100644
+--- a/hw/p8-i2c.c
++++ b/hw/p8-i2c.c
+@@ -29,7 +29,7 @@
+ #include <errorlog.h>
+ #include <centaur.h>
+ /* XXX SRC's will be moved to errorlog.h and then remove fsp-elog.h */
+-#include <fsp-elog.h>
++#include <common-elog.h>
+ 
+ DEFINE_LOG_ENTRY(OPAL_RC_I2C_INIT, OPAL_PLATFORM_ERR_EVT, OPAL_I2C,
+ 		 OPAL_IO_SUBSYSTEM, OPAL_PREDICTIVE_ERR_DEGRADED_PERF,
+diff --git a/include/common-elog.h b/include/common-elog.h
+new file mode 100644
+index 0000000..732b81c
+--- /dev/null
++++ b/include/common-elog.h
+@@ -0,0 +1,80 @@
++/* Copyright 2013-2014 IBM Corp.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * 	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++ * implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include <opal.h>
++#include <errorlog.h>
++#include <pel.h>
++#ifndef __OPALELOG_H
++#define __OPALELOG_H
++
++/* structure to maintain log-id,log-size, pending and processed list */
++struct log_entry {
++        uint32_t log_id;
++        size_t log_size;
++        struct list_node link;
++};
++
++/* Following variables are used to indicate state of the
++ * head log entry which is being fetched from FSP/OPAL and
++ * these variables are not overwritten until next log is
++ * retrieved from FSP/OPAL.
++ */
++enum elog_head_state {
++        ELOG_STATE_FETCHING,    /*In the process of reading log from FSP. */
++        ELOG_STATE_FETCHED_INFO,/* Indicates reading log info is completed */
++        ELOG_STATE_FETCHED_DATA,/* Indicates reading log is completed */
++        ELOG_STATE_NONE,        /* Indicates to fetch next log */
++        ELOG_STATE_REJECTED,    /* resend all pending logs to linux */
++};
++
++#define ELOG_TYPE_PEL                   0
++#define MAX_RETRIES                     3
++
++/*
++ * Maximum number of entries that are pre-allocated
++ * to keep track of pending elogs to be fetched.
++ */
++#define ELOG_READ_MAX_RECORD            128
++
++/*Log buffer  to copy FSP log for READ */
++#define ELOG_READ_BUFFER_SIZE   0x00004000
++
++/*Log buffer size to WRITE into Host */
++#define ELOG_WRITE_TO_HOST_BUFFER_SIZE  0x00004000
++
++#define ELOG_PANIC_WRITE_BUFFER_SIZE    0x00004000
++
++/* Generate src from opal reason code (src_comp) */
++#define generate_src_from_comp(src_comp)  (OPAL_SRC_TYPE_ERROR << 24 | \
++                                OPAL_FAILING_SUBSYSTEM << 16 | src_comp)
++
++int elog_fsp_commit(struct errorlog *buf) __warn_unused_result;
++
++bool opal_elog_info(uint64_t *opal_elog_id, uint64_t *opal_elog_size) __warn_unused_result;
++
++bool opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
++                                                uint64_t opal_elog_id) __warn_unused_result;
++
++bool opal_elog_ack(uint64_t ack_id) __warn_unused_result;
++
++void opal_resend_pending_logs(void);
++
++void opal_commit_elog_in_host(void);
++
++void elog_append_write_to_host(struct errorlog *buf);
++
++int init_elog_read_free_list(uint32_t);
++
++#endif /* __OPALELOG_H */
+diff --git a/include/fsp-elog.h b/include/fsp-elog.h
+deleted file mode 100644
+index 1522b18..0000000
+--- a/include/fsp-elog.h
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/* Copyright 2013-2014 IBM Corp.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * 	http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+- * implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-#include <opal.h>
+-#include <errorlog.h>
+-#include <pel.h>
+-#ifndef __ELOG_H
+-#define __ELOG_H
+-
+-#define ELOG_TYPE_PEL			0
+-#define MAX_RETRIES			3
+-
+-/* Following variables are used to indicate state of the
+- * head log entry which is being fetched from FSP/OPAL and
+- * these variables are not overwritten until next log is
+- * retrieved from FSP/OPAL.
+- */
+-enum elog_head_state {
+-	ELOG_STATE_FETCHING,    /*In the process of reading log from FSP. */
+-	ELOG_STATE_FETCHED_INFO,/* Indicates reading log info is completed */
+-	ELOG_STATE_FETCHED_DATA,/* Indicates reading log is completed */
+-	ELOG_STATE_NONE,        /* Indicates to fetch next log */
+-	ELOG_STATE_REJECTED,    /* resend all pending logs to linux */
+-};
+-
+-/* Generate src from opal reason code (src_comp) */
+-#define generate_src_from_comp(src_comp)  (OPAL_SRC_TYPE_ERROR << 24 | \
+-				OPAL_FAILING_SUBSYSTEM << 16 | src_comp)
+-
+-int elog_fsp_commit(struct errorlog *buf) __warn_unused_result;
+-
+-bool opal_elog_info(uint64_t *opal_elog_id, uint64_t *opal_elog_size) __warn_unused_result;
+-
+-bool opal_elog_read(uint64_t *buffer, uint64_t opal_elog_size,
+-						uint64_t opal_elog_id) __warn_unused_result;
+-
+-bool opal_elog_ack(uint64_t ack_id) __warn_unused_result;
+-
+-void opal_resend_pending_logs(void);
+-
+-#endif /* __ELOG_H */
+-- 
+1.9.3
+
